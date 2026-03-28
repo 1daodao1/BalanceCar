@@ -14,4 +14,5 @@ void BlueSerial_SendNumber(uint32_t Number, uint8_t Length);
 void BlueSerial_Printf(char *format, ...);
 void BlueSerial_Printf_DMA(char *format, ...);
 
+
 #endif

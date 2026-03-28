@@ -41,6 +41,17 @@ void BlueSerial_Printf_DMA(char *format, ...)
     
     // 使用 DMA 发送数据
     HAL_UART_Transmit_DMA(&huart2, (uint8_t *)BlueSerial_TxPacket, strlen(BlueSerial_TxPacket));
+	
+}
+
+void BlueSerial_Printf(char *format, ...)
+{
+    va_list arg;
+    va_start(arg, format);
+    vsprintf(BlueSerial_TxPacket, format, arg);
+    va_end(arg);
+	
+	 HAL_UART_Transmit(&huart2, (uint8_t *)BlueSerial_TxPacket, strlen(BlueSerial_TxPacket), HAL_MAX_DELAY);
 }
 
 void BlueSerial_SendByte(uint8_t Byte)
@@ -82,15 +93,15 @@ void BlueSerial_SendNumber(uint32_t Number, uint8_t Length)
 
 
 
-void BlueSerial_Printf(char *format, ...)
-{
-	char String[100];
-	va_list arg;
-	va_start(arg, format);
-	vsprintf(String, format, arg);
-	va_end(arg);
-	BlueSerial_SendString(String);
-}
+//void BlueSerial_Printf(char *format, ...)
+//{
+//	char String[100];
+//	va_list arg;
+//	va_start(arg, format);
+//	vsprintf(String, format, arg);
+//	va_end(arg);
+//	BlueSerial_SendString(String);
+//}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {

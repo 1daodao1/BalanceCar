@@ -1,22 +1,29 @@
 #include "main.h"
 
+static void MyI2C_Delay(void)
+{
+    volatile uint32_t i = 1; // 极短延时即可，原来15太长导致占用大量CPU
+    while(i--) { __NOP(); }
+}
+
 //���庯�������ڲ����˿ڵĺ������з�װ��W��д��R�Ƕ�
 void MyI2C_W_SCL(uint8_t BitValue)
 {
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_10, BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET);
+	MyI2C_Delay();
 }
 
 void MyI2C_W_SDA(uint8_t BitValue)
 {
 	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_11, BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET);
-//	Delay_us(10);//��װ�����ӳ�
+	MyI2C_Delay();
 }
 
 uint8_t MyI2C_R_SDA(void)
 {
 	uint8_t BitValue;
 	BitValue = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_11) == GPIO_PIN_SET ? 1 : 0;
-//	Delay_us(10);
+	MyI2C_Delay();
 	return BitValue;
 }
 

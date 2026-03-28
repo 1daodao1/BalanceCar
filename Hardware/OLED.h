@@ -5,7 +5,7 @@
 #include "OLED_Data.h"
 
 /*参数宏定义*********************/
-
+void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c);
 /*FontSize参数取值*/
 /*此参数值不仅用于判断，而且用于计算横向字符偏移，默认值为字体像素宽度*/
 #define OLED_8X16				8

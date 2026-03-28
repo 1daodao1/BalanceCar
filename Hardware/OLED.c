@@ -24,6 +24,12 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "i2c.h"  // 确保包含此头文件以使用 hi2c1
+
+// 如果 hi2c1 在 main.c 定义，这里需要 extern 声明
+extern I2C_HandleTypeDef hi2c1; 
+
+#define OLED_ADDRESS 0x78 // OLED 的 I2C 从机地址
 
 /**
   * 数据存储格式：
@@ -79,7 +85,14 @@
   * 随后调用OLED_Update函数或OLED_UpdateArea函数
   * 才会将显存数组的数据发送到OLED硬件，进行显示
   */
-uint8_t OLED_DisplayBuf[8][128];
+// 将显存展平为 1024 字节 (128*64/8)，方便 DMA 一次性发送
+uint8_t OLED_BufferA[1024];
+uint8_t OLED_BufferB[1024];
+
+uint8_t *OLED_Canvas = OLED_BufferA; // 指向正在绘制的缓冲区
+uint8_t *OLED_Display = OLED_BufferB; // 指向正在发送的缓冲区
+
+volatile uint8_t g_I2C_BusyFlag = 0; // DMA 传输状态标志
 
 /*********************全局变量*/
 
@@ -87,37 +100,21 @@ uint8_t OLED_DisplayBuf[8][128];
 /*引脚配置*********************/
 
 /**
-  * 函    数：OLED写SCL高低电平
-  * 参    数：要写入SCL的电平值，范围：0/1
-  * 返 回 值：无
-  * 说    明：当上层函数需要写SCL时，此函数会被调用
-  *           用户需要根据参数传入的值，将SCL置为高电平或者低电平
-  *           当参数传入0时，置SCL为低电平，当参数传入1时，置SCL为高电平
+  * 函    数：OLED写命令
+  * 说    明：硬件 I2C 实现，0x00 为命令寄存器地址
   */
-void OLED_W_SCL(uint8_t BitValue)
+void OLED_WriteCommand(uint8_t Command)
 {
-	/*根据BitValue的值，将SCL置高电平或者低电平*/
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET);
-	
-	/*如果单片机速度过快，可在此添加适量延时，以避免超出I2C通信的最大速度*/
-	//...
+    HAL_I2C_Mem_Write(&hi2c1, OLED_ADDRESS, 0x00, I2C_MEMADD_SIZE_8BIT, &Command, 1, HAL_MAX_DELAY);
 }
 
 /**
-  * 函    数：OLED写SDA高低电平
-  * 参    数：要写入SDA的电平值，范围：0/1
-  * 返 回 值：无
-  * 说    明：当上层函数需要写SDA时，此函数会被调用
-  *           用户需要根据参数传入的值，将SDA置为高电平或者低电平
-  *           当参数传入0时，置SDA为低电平，当参数传入1时，置SDA为高电平
+  * 函    数：OLED写数据
+  * 说    明：硬件 I2C 实现，0x40 为数据寄存器地址
   */
-void OLED_W_SDA(uint8_t BitValue)
+void OLED_WriteData(uint8_t *Data, uint8_t Count)
 {
-	/*根据BitValue的值，将SDA置高电平或者低电平，三目运算符*/
-	HAL_GPIO_WritePin(GPIOB, GPIO_PIN_9, BitValue ? GPIO_PIN_SET : GPIO_PIN_RESET);
-	
-	/*如果单片机速度过快，可在此添加适量延时，以避免超出I2C通信的最大速度*/
-	//...
+    HAL_I2C_Mem_Write(&hi2c1, OLED_ADDRESS, 0x40, I2C_MEMADD_SIZE_8BIT, Data, Count, HAL_MAX_DELAY);
 }
 
 /**
@@ -129,19 +126,10 @@ void OLED_W_SDA(uint8_t BitValue)
   */
 void OLED_GPIO_Init(void)
 {
-	uint32_t i, j;
+    // 硬件 I2C 引脚由 HAL_I2C_MspInit 自动初始化
+    // 如果需要给 OLED 供电稳定时间，可以保留延时
+    HAL_Delay(100); 
 	
-	/*在初始化前，加入适量延时，待OLED供电稳定*/
-	for (i = 0; i < 1000; i ++)
-	{
-		for (j = 0; j < 1000; j ++);
-	}
-	
-
-	
-	/*释放SCL和SDA*/
-	OLED_W_SCL(1);
-	OLED_W_SDA(1);
 }
 
 /*********************引脚配置*/
@@ -149,88 +137,6 @@ void OLED_GPIO_Init(void)
 
 /*通信协议*********************/
 
-/**
-  * 函    数：I2C起始
-  * 参    数：无
-  * 返 回 值：无
-  */
-void OLED_I2C_Start(void)
-{
-	OLED_W_SDA(1);		//释放SDA，确保SDA为高电平
-	OLED_W_SCL(1);		//释放SCL，确保SCL为高电平
-	OLED_W_SDA(0);		//在SCL高电平期间，拉低SDA，产生起始信号
-	OLED_W_SCL(0);		//起始后把SCL也拉低，即为了占用总线，也为了方便总线时序的拼接
-}
-
-/**
-  * 函    数：I2C终止
-  * 参    数：无
-  * 返 回 值：无
-  */
-void OLED_I2C_Stop(void)
-{
-	OLED_W_SDA(0);		//拉低SDA，确保SDA为低电平
-	OLED_W_SCL(1);		//释放SCL，使SCL呈现高电平
-	OLED_W_SDA(1);		//在SCL高电平期间，释放SDA，产生终止信号
-}
-
-/**
-  * 函    数：I2C发送一个字节
-  * 参    数：Byte 要发送的一个字节数据，范围：0x00~0xFF
-  * 返 回 值：无
-  */
-void OLED_I2C_SendByte(uint8_t Byte)
-{
-	uint8_t i;
-	
-	/*循环8次，主机依次发送数据的每一位*/
-	for (i = 0; i < 8; i++)
-	{
-		/*使用掩码的方式取出Byte的指定一位数据并写入到SDA线*/
-		/*两个!的作用是，让所有非零的值变为1*/
-		OLED_W_SDA(!!(Byte & (0x80 >> i)));
-		OLED_W_SCL(1);	//释放SCL，从机在SCL高电平期间读取SDA
-		OLED_W_SCL(0);	//拉低SCL，主机开始发送下一位数据
-	}
-	
-	OLED_W_SCL(1);		//额外的一个时钟，不处理应答信号
-	OLED_W_SCL(0);
-}
-
-/**
-  * 函    数：OLED写命令
-  * 参    数：Command 要写入的命令值，范围：0x00~0xFF
-  * 返 回 值：无
-  */
-void OLED_WriteCommand(uint8_t Command)
-{
-	OLED_I2C_Start();				//I2C起始
-	OLED_I2C_SendByte(0x78);		//发送OLED的I2C从机地址
-	OLED_I2C_SendByte(0x00);		//控制字节，给0x00，表示即将写命令
-	OLED_I2C_SendByte(Command);		//写入指定的命令
-	OLED_I2C_Stop();				//I2C终止
-}
-
-/**
-  * 函    数：OLED写数据
-  * 参    数：Data 要写入数据的起始地址
-  * 参    数：Count 要写入数据的数量
-  * 返 回 值：无
-  */
-void OLED_WriteData(uint8_t *Data, uint8_t Count)
-{
-	uint8_t i;
-	
-	OLED_I2C_Start();				//I2C起始
-	OLED_I2C_SendByte(0x78);		//发送OLED的I2C从机地址
-	OLED_I2C_SendByte(0x40);		//控制字节，给0x40，表示即将写数据
-	/*循环Count次，进行连续的数据写入*/
-	for (i = 0; i < Count; i ++)
-	{
-		OLED_I2C_SendByte(Data[i]);	//依次发送Data的每一个数据
-	}
-	OLED_I2C_Stop();				//I2C终止
-}
 
 /*********************通信协议*/
 
@@ -245,6 +151,14 @@ void OLED_WriteData(uint8_t *Data, uint8_t Count)
   */
 void OLED_Init(void)
 {
+	// 1. 强行重置 I2C 外设状态机（解决 F1 系列硬件 I2C 假死）
+    __HAL_RCC_I2C1_FORCE_RESET();
+    HAL_Delay(10);
+    __HAL_RCC_I2C1_RELEASE_RESET();
+    
+    // 2. 重新初始化 I2C（调用 CubeMX 生成的初始化函数）
+    MX_I2C1_Init();
+	
 	OLED_GPIO_Init();			//先调用底层的端口初始化
 	
 	/*写入一系列的命令，对OLED进行初始化配置*/
@@ -286,8 +200,16 @@ void OLED_Init(void)
 
 	OLED_WriteCommand(0xAF);	//开启显示
 	
-	OLED_Clear();				//清空显存数组
-	OLED_Update();				//更新显示，清屏，防止初始化后未显示内容时花屏
+	OLED_WriteCommand(0x20); // 设置寻址模式
+    OLED_WriteCommand(0x00); // 0x00: 水平寻址模式 (Horizontal Addressing Mode)
+    
+    // 设置列起始和结束地址 (0-127)
+    OLED_WriteCommand(0x21); OLED_WriteCommand(0x00); OLED_WriteCommand(0x7F);
+    // 设置页起始和结束地址 (0-7)
+    OLED_WriteCommand(0x22); OLED_WriteCommand(0x00); OLED_WriteCommand(0x07);
+    
+    OLED_Clear();
+    OLED_Update();
 }
 
 /**
@@ -404,16 +326,21 @@ uint8_t OLED_IsInAngle(int16_t X, int16_t Y, int16_t StartAngle, int16_t EndAngl
   */
 void OLED_Update(void)
 {
-	uint8_t j;
-	/*遍历每一页*/
-	for (j = 0; j < 8; j ++)
+	if (g_I2C_BusyFlag) return; // 如果 DMA 还没传完，直接跳过
+
+	// 交换双缓冲指针
+	uint8_t *Temp = OLED_Canvas;
+	OLED_Canvas = OLED_Display;
+	OLED_Display = Temp;
+
+	g_I2C_BusyFlag = 1;
+	// 0x40 是 SSD1306 的数据起始控制字节
+	if (HAL_I2C_Mem_Write_DMA(&hi2c1, 0x78, 0x40, I2C_MEMADD_SIZE_8BIT, OLED_Display, 1024) != HAL_OK)
 	{
-		/*设置光标位置为每一页的第一列*/
-		OLED_SetCursor(j, 0);
-		/*连续写入128个数据，将显存数组的数据写入到OLED硬件*/
-		OLED_WriteData(OLED_DisplayBuf[j], 128);
+		g_I2C_BusyFlag = 0; // 如果启动失败，清除标志位，以免卡死
 	}
 }
+
 
 /**
   * 函    数：将OLED显存数组部分更新到OLED屏幕
@@ -434,25 +361,17 @@ void OLED_UpdateArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
 	int16_t j;
 	int16_t Page, Page1;
 	
-	/*负数坐标在计算页地址时需要加一个偏移*/
-	/*(Y + Height - 1) / 8 + 1的目的是(Y + Height) / 8并向上取整*/
 	Page = Y / 8;
 	Page1 = (Y + Height - 1) / 8 + 1;
-	if (Y < 0)
-	{
-		Page -= 1;
-		Page1 -= 1;
-	}
+	if (Y < 0) { Page -= 1; Page1 -= 1; }
 	
-	/*遍历指定区域涉及的相关页*/
 	for (j = Page; j < Page1; j ++)
 	{
-		if (X >= 0 && X <= 127 && j >= 0 && j <= 7)		//超出屏幕的内容不显示
+		if (X >= 0 && X <= 127 && j >= 0 && j <= 7)
 		{
-			/*设置光标位置为相关页的指定列*/
 			OLED_SetCursor(j, X);
-			/*连续写入Width个数据，将显存数组的数据写入到OLED硬件*/
-			OLED_WriteData(&OLED_DisplayBuf[j][X], Width);
+            // 关键：这里直接传入 Canvas 的一维地址偏移
+			OLED_WriteData(&OLED_Canvas[j * 128 + X], Width);
 		}
 	}
 }
@@ -470,35 +389,12 @@ void OLED_Clear(void)
 	{
 		for (i = 0; i < 128; i ++)			//遍历128列
 		{
-			OLED_DisplayBuf[j][i] = 0x00;	//将显存数组数据全部清零
+			OLED_Canvas[j * 128 + i] = 0x00;	//将显存数组数据全部清零
 		}
 	}
 }
 
-/**
-  * 函    数：将OLED显存数组部分清零
-  * 参    数：X 指定区域左上角的横坐标，范围：-32768~32767，屏幕区域：0~127
-  * 参    数：Y 指定区域左上角的纵坐标，范围：-32768~32767，屏幕区域：0~63
-  * 参    数：Width 指定区域的宽度，范围：0~128
-  * 参    数：Height 指定区域的高度，范围：0~64
-  * 返 回 值：无
-  * 说    明：调用此函数后，要想真正地呈现在屏幕上，还需调用更新函数
-  */
-void OLED_ClearArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
-{
-	int16_t i, j;
-	
-	for (j = Y; j < Y + Height; j ++)		//遍历指定页
-	{
-		for (i = X; i < X + Width; i ++)	//遍历指定列
-		{
-			if (i >= 0 && i <= 127 && j >=0 && j <= 63)				//超出屏幕的内容不显示
-			{
-				OLED_DisplayBuf[j / 8][i] &= ~(0x01 << (j % 8));	//将显存数组指定数据清零
-			}
-		}
-	}
-}
+
 
 /**
   * 函    数：将OLED显存数组全部取反
@@ -506,14 +402,18 @@ void OLED_ClearArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
   * 返 回 值：无
   * 说    明：调用此函数后，要想真正地呈现在屏幕上，还需调用更新函数
   */
-void OLED_Reverse(void)
+void OLED_ClearArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
 {
-	uint8_t i, j;
-	for (j = 0; j < 8; j ++)				//遍历8页
+	int16_t i, j;
+	for (j = Y; j < Y + Height; j ++)
 	{
-		for (i = 0; i < 128; i ++)			//遍历128列
+		for (i = X; i < X + Width; i ++)
 		{
-			OLED_DisplayBuf[j][i] ^= 0xFF;	//将显存数组数据全部取反
+			if (i >= 0 && i <= 127 && j >=0 && j <= 63)
+			{
+				// 修改为一维数组寻址
+				OLED_Canvas[(j / 8) * 128 + i] &= ~(0x01 << (j % 8));
+			}
 		}
 	}
 }
@@ -530,14 +430,14 @@ void OLED_Reverse(void)
 void OLED_ReverseArea(int16_t X, int16_t Y, uint8_t Width, uint8_t Height)
 {
 	int16_t i, j;
-	
-	for (j = Y; j < Y + Height; j ++)		//遍历指定页
+	for (j = Y; j < Y + Height; j ++)		// 遍历纵向坐标
 	{
-		for (i = X; i < X + Width; i ++)	//遍历指定列
+		for (i = X; i < X + Width; i ++)	// 遍历横向坐标
 		{
-			if (i >= 0 && i <= 127 && j >=0 && j <= 63)			//超出屏幕的内容不显示
+			if (i >= 0 && i <= 127 && j >=0 && j <= 63)
 			{
-				OLED_DisplayBuf[j / 8][i] ^= 0x01 << (j % 8);	//将显存数组指定数据取反
+				// 关键点：使用循环变量 i 和 j，而不是参数 X, Y
+				OLED_Canvas[(j / 8) * 128 + i] ^= (0x01 << (j % 8));
 			}
 		}
 	}
@@ -872,38 +772,26 @@ void OLED_ShowImage(int16_t X, int16_t Y, uint8_t Width, uint8_t Height, const u
 {
 	uint8_t i = 0, j = 0;
 	int16_t Page, Shift;
-	
-	/*将图像所在区域清空*/
 	OLED_ClearArea(X, Y, Width, Height);
 	
-	/*遍历指定图像涉及的相关页*/
-	/*(Height - 1) / 8 + 1的目的是Height / 8并向上取整*/
 	for (j = 0; j < (Height - 1) / 8 + 1; j ++)
 	{
-		/*遍历指定图像涉及的相关列*/
 		for (i = 0; i < Width; i ++)
 		{
-			if (X + i >= 0 && X + i <= 127)		//超出屏幕的内容不显示
+			if (X + i >= 0 && X + i <= 127)
 			{
-				/*负数坐标在计算页地址和移位时需要加一个偏移*/
 				Page = Y / 8;
 				Shift = Y % 8;
-				if (Y < 0)
-				{
-					Page -= 1;
-					Shift += 8;
-				}
+				if (Y < 0) { Page -= 1; Shift += 8; }
 				
-				if (Page + j >= 0 && Page + j <= 7)		//超出屏幕的内容不显示
+				if (Page + j >= 0 && Page + j <= 7)
 				{
-					/*显示图像在当前页的内容*/
-					OLED_DisplayBuf[Page + j][X + i] |= Image[j * Width + i] << (Shift);
+					// 修改这里：使用一维索引映射到 OLED_Canvas
+					OLED_Canvas[(Page + j) * 128 + (X + i)] |= Image[j * Width + i] << (Shift);
 				}
-				
-				if (Page + j + 1 >= 0 && Page + j + 1 <= 7)		//超出屏幕的内容不显示
+				if (Page + j + 1 >= 0 && Page + j + 1 <= 7)
 				{					
-					/*显示图像在下一页的内容*/
-					OLED_DisplayBuf[Page + j + 1][X + i] |= Image[j * Width + i] >> (8 - Shift);
+					OLED_Canvas[(Page + j + 1) * 128 + (X + i)] |= Image[j * Width + i] >> (8 - Shift);
 				}
 			}
 		}
@@ -945,11 +833,11 @@ void OLED_Printf(int16_t X, int16_t Y, uint8_t FontSize, char *format, ...)
   */
 void OLED_DrawPoint(int16_t X, int16_t Y)
 {
-	if (X >= 0 && X <= 127 && Y >=0 && Y <= 63)		//超出屏幕的内容不显示
-	{
-		/*将显存数组指定位置的一个Bit数据置1*/
-		OLED_DisplayBuf[Y / 8][X] |= 0x01 << (Y % 8);
-	}
+	if (X >= 0 && X <= 127 && Y >= 0 && Y <= 63)
+    {
+        // 对应一维数组的计算公式：(Y / 8) * 128 + X
+        OLED_Canvas[(Y / 8) * 128 + X] |= 0x01 << (Y % 8);
+    }
 }
 
 /**
@@ -960,16 +848,15 @@ void OLED_DrawPoint(int16_t X, int16_t Y)
   */
 uint8_t OLED_GetPoint(int16_t X, int16_t Y)
 {
-	if (X >= 0 && X <= 127 && Y >=0 && Y <= 63)		//超出屏幕的内容不读取
+	if (X >= 0 && X <= 127 && Y >= 0 && Y <= 63)
 	{
-		/*判断指定位置的数据*/
-		if (OLED_DisplayBuf[Y / 8][X] & 0x01 << (Y % 8))
+		// 关键点：确保 X, Y 大写与参数定义一致
+		if (OLED_Canvas[(Y / 8) * 128 + X] & (0x01 << (Y % 8)))
 		{
-			return 1;	//为1，返回1
+			return 1;
 		}
 	}
-	
-	return 0;		//否则，返回0
+	return 0;
 }
 
 /**
@@ -1462,6 +1349,26 @@ void OLED_DrawArc(int16_t X, int16_t Y, uint8_t Radius, int16_t StartAngle, int1
 			}
 		}
 	}
+}
+
+/* DMA 传输完成回调函数 */
+void HAL_I2C_MemTxCpltCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C1) // 如果你用的是 I2C1
+    {
+        g_I2C_BusyFlag = 0; // 允许下一帧开始传输
+    }
+}
+
+/* I2C 错误回调函数，防止出错时 DMA 标志位卡死 */
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c)
+{
+    if (hi2c->Instance == I2C1)
+    {
+        g_I2C_BusyFlag = 0;
+        // 可选：重启 I2C 外设或者重新初始化
+        // MX_I2C1_Init(); 
+    }
 }
 
 /*********************功能函数*/

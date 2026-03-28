@@ -49,11 +49,46 @@ float LeftSpeed, RightSpeed;
 float AveSpeed, DifSpeed;
 
 
+/* 声明定义在 OLED.c 中的全局变量 */
+extern volatile uint8_t g_I2C_BusyFlag;
+
 extern UART_HandleTypeDef huart1;
 //二值信号量申明
 extern osSemaphoreId_t myBinarySem01Handle;
 //互斥信号量申明
 extern osMutexId_t myMutex01Handle;
+
+// DWT寄存器用于测量执行时间（周期计数）
+#define DWT_CR      *(volatile uint32_t *)0xE0001000  //DWT 控制寄存器，用于开启或关闭计数功能。
+#define DWT_CYCCNT  *(volatile uint32_t *)0xE0001004  //它是一个 32 位的计数器，CPU 每经过一个时钟周期，它的值就加 1。
+#define DEM_CR      *(volatile uint32_t *)0xE000EDFC  //调试异常监控控制寄存器
+#define DEM_CR_TRCENA                   (1 << 24)//激活，供电
+#define DWT_CR_CYCCNTENA                (1 << 0)//CPU时钟开始累加计数
+
+// 记录各任务执行时间（微秒）
+uint32_t Balance_ExecTime_us = 0;
+uint32_t Speed_ExecTime_us = 0;
+uint32_t Comms_ExecTime_us = 0;
+uint32_t UI_ExecTime_us = 0;
+
+// 记录各任务运行周期（微秒）
+uint32_t Balance_CycleTime_us = 0;
+uint32_t Speed_CycleTime_us = 0;
+uint32_t Comms_CycleTime_us = 0;
+uint32_t UI_CycleTime_us = 0;
+
+void StartTimerForRunTimeStats(void)
+{
+    DEM_CR |= DEM_CR_TRCENA;  //开启跟踪组件的使用权限
+    DWT_CYCCNT = 0;  					//将计数器清零
+    DWT_CR |= DWT_CR_CYCCNTENA;//正式启用启用循环计数器（CYCCNT）
+}
+
+// 这个函数就是 FreeRTOS 用来统计百分比的“尺子”
+uint32_t GetTimerForRunTimeStats(void) 
+{
+    return DWT_CYCCNT; 
+}
 
 //关于PID的角动量
 PID_t AnglePID = {
@@ -101,6 +136,8 @@ PID_t TurnPID = {
 void vTask_Balance()
 {
 
+	static uint32_t last_start_time = 0;
+	
     while(1)
     {
         // 死等 TIM1 中断发来的通知 (一直阻塞，不消耗 CPU，直到 5ms 信号到来)
@@ -109,6 +146,13 @@ void vTask_Balance()
 				//根据设置，这里5ms进入一次
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 				
+			
+				//开始DWT计数
+				uint32_t start_time = DWT_CYCCNT;
+        if (last_start_time != 0) {
+            Balance_CycleTime_us = (start_time - last_start_time) / (SystemCoreClock / 1000000);
+        }
+				last_start_time = start_time;
 
         // ==========================================
         // 此时刚刚经过绝对精准的 5ms，开始姿态解算和 PID
@@ -137,7 +181,7 @@ void vTask_Balance()
 			
         MPU6050_GetData(&AX, &AY, &AZ, &GX, &GY, &GZ);
         
-        GY -= 16; // 消除零点漂移 (根据你实际测试的值调整)
+        GY -= 0; // 消除零点漂移 (根据你实际测试的值调整)
         
         // 1. 加速度计计算角度
         AngleAcc = -atan2(AX , AZ) / 3.14159f * 180.0f;
@@ -184,6 +228,8 @@ void vTask_Balance()
             Motor_SetPWM(1, 0);
             Motor_SetPWM(2, 0);
         }
+				
+		 Balance_ExecTime_us = (DWT_CYCCNT - start_time) / (SystemCoreClock / 1000000);
     }
 }
 
@@ -191,9 +237,17 @@ void vTask_Speed()
 {
 	// 获取进入时间
 	TickType_t xLastWakeTime = xTaskGetTickCount();
+	static uint32_t last_start_time = 0;
 	
 	 while(1)
     {
+			//获取时间
+				uint32_t start_time = DWT_CYCCNT;
+        if (last_start_time != 0) {
+            Speed_CycleTime_us = (start_time - last_start_time) / (SystemCoreClock / 1000000);
+        }
+        last_start_time = start_time;
+			
         LeftSpeed = Encoder_Get(1) / 44.0f / 0.05f / 9.27666f;
         RightSpeed = Encoder_Get(2) / 44.0f / 0.05f / 9.27666f;
         
@@ -215,6 +269,9 @@ void vTask_Speed()
             AnglePID.Target = 0;
             DifPWM = 0;
         }
+				
+				Speed_ExecTime_us = (DWT_CYCCNT - start_time) / (SystemCoreClock / 1000000);
+				
 				//绝对延迟50ms
      vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(50));
 		}
@@ -224,8 +281,17 @@ void vTask_Speed()
 void vTask_Comms()
 {
 	TickType_t xLastWakeTime = xTaskGetTickCount();
+	static uint32_t last_start_time = 0;
+	static char pcWriteBuffer[512];//对于内存占用情况定义数组存放数据
 	while(1)
 	{
+		
+		uint32_t start_time = DWT_CYCCNT;
+    if (last_start_time != 0) {
+            Comms_CycleTime_us = (start_time - last_start_time) / (SystemCoreClock / 1000000);
+        }
+    last_start_time = start_time;
+		
     //使用蓝牙获取PID值
 		if (BlueSerial_RxFlag == 1)
 		{
@@ -302,51 +368,118 @@ void vTask_Comms()
 			
 			BlueSerial_RxFlag = 0;
 		}
-		BlueSerial_Printf_DMA("[plot,%f,%f]", TurnPID.Target,DifSpeed);
-		 vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(20));
+		
+//		// 打印4个任务的剩余堆栈空间（单位是字，1字=4字节）
+//		// 只有在句柄有效的情况下才打印，防止初始化未完成时崩溃
+//		if (BalanceTask_Handler && SpeedTask_Handler && CommsTask_Handler && UITask_Handler)
+//		{
+//			printf("FreeStack - Balance: %lu, Speed: %lu, Comms: %lu, UI: %lu\r\n",
+//				   (unsigned long)uxTaskGetStackHighWaterMark(BalanceTask_Handler),
+//				   (unsigned long)uxTaskGetStackHighWaterMark(SpeedTask_Handler),
+//				   (unsigned long)uxTaskGetStackHighWaterMark(CommsTask_Handler),
+//				   (unsigned long)uxTaskGetStackHighWaterMark(UITask_Handler));
+//		}
+		
+		// --- 添加 CPU 占用率打印 ---
+    // 建议每隔 1000ms 或 2000ms 打印一次，否则串口会刷屏太快
+        static uint32_t last_print_tick = 0;
+        if (xTaskGetTickCount() - last_print_tick > pdMS_TO_TICKS(2000)) 
+        {
+            last_print_tick = xTaskGetTickCount();
+            
+            printf("\r\n--- Task CPU Usage (DWT Based) ---\r\n");
+            printf("Task Name\tAbs Time\tTime %%\r\n");
+            printf("----------------------------------------------\r\n");
+            
+            // 获取统计字符串
+            vTaskGetRunTimeStats(pcWriteBuffer);
+            
+            // 打印生成的表格
+            printf("%s", pcWriteBuffer);
+            printf("----------------------------------------------\r\n");
+        }
+		
+
+//       // 打印每个任务的执行时间和周期时间 (单位：微秒)
+//    printf("Exec(us) - B:%lu, S:%lu, C:%lu, U:%lu | Cycle(us) - B:%lu, S:%lu, C:%lu, U:%lu\r\n",
+//             Balance_ExecTime_us, Speed_ExecTime_us, Comms_ExecTime_us, UI_ExecTime_us,
+//             Balance_CycleTime_us, Speed_CycleTime_us, Comms_CycleTime_us, UI_CycleTime_us);
+//		
+		BlueSerial_Printf("[plot,%f,%f]", TurnPID.Target,DifSpeed);
+//		
+		Comms_ExecTime_us = (DWT_CYCCNT - start_time) / (SystemCoreClock / 1000000);
+//		
+				
+				
+		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(80));
 	}
 	
 }
 
 void vTask_UI()
 {
-	TickType_t xLastWakeTime = xTaskGetTickCount();
-	
-	while(1)
-	{
-		OLED_Clear();
-		OLED_Printf(0, 0, OLED_6X8, "  Angle");
-		OLED_Printf(0, 8, OLED_6X8, "P:%05.2f",AnglePID.Kp);
-		OLED_Printf(0, 16, OLED_6X8, "I:%05.2f",AnglePID.Ki);
-		OLED_Printf(0, 24, OLED_6X8, "D:%05.2f",AnglePID.Kd);
-		OLED_Printf(0, 32, OLED_6X8, "T:%05.1f",AnglePID.Target);//目标
-		OLED_Printf(0, 40, OLED_6X8, "A:%05.1f",Angle);//真实
-		OLED_Printf(0, 48, OLED_6X8, "O:%05.1f",AnglePID.Out);//输出
-		OLED_Printf(0, 56, OLED_6X8, "GY:%+05d",GY);
-		
-		OLED_Printf(56, 56, OLED_6X8, "Offset:%02.0f",AnglePID.OutOffset);
-		
-		OLED_Printf(50, 0, OLED_6X8, "Speed");
-		OLED_Printf(50, 8, OLED_6X8, ":%05.2f",SpeedPID.Kp);
-		OLED_Printf(50, 16, OLED_6X8, ":%05.2f",SpeedPID.Ki);
-		OLED_Printf(50, 24, OLED_6X8, ":%05.2f",SpeedPID.Kd);
-		OLED_Printf(50, 32, OLED_6X8, ":%05.1f",SpeedPID.Target);//目标
-		OLED_Printf(50, 40, OLED_6X8, ":%05.1f",AveSpeed);//真实
-		OLED_Printf(50, 48, OLED_6X8, ":%05.1f",SpeedPID.Out);//输出
-		
-		OLED_Printf(88, 0, OLED_6X8, "Turn");
-		OLED_Printf(88, 8, OLED_6X8, ":%05.2f",TurnPID.Kp);
-		OLED_Printf(88, 16, OLED_6X8, ":%05.2f",TurnPID.Ki);
-		OLED_Printf(88, 24, OLED_6X8, ":%05.2f",TurnPID.Kd);
-		OLED_Printf(88, 32, OLED_6X8, ":%05.1f",TurnPID.Target);//目标
-		OLED_Printf(88, 40, OLED_6X8, ":%05.1f",DifSpeed);//真实
-		OLED_Printf(88, 48, OLED_6X8, ":%05.1f",TurnPID.Out);//输出
-		
-		OLED_Update();//*更新OLED
-		vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
-	}
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    static uint32_t last_start_time = 0;
     
+    while(1)
+    {
+        // 只有当 DMA 传输不忙时，才进行“绘图”和“更新”
+        if (g_I2C_BusyFlag == 0) 
+        {
+            uint32_t start_time = DWT_CYCCNT; // 记录开始绘图的时间点
+
+            // --- 周期时间统计 ---
+            if (last_start_time != 0) 
+            {
+                UI_CycleTime_us = (start_time - last_start_time) / (SystemCoreClock / 1000000);
+            }
+            last_start_time = start_time;
+
+            // --- 绘图逻辑 ---
+            OLED_Clear(); // 修改 Canvas
+            
+            // 角度环数据
+            OLED_Printf(0, 0, OLED_6X8, "  Angle");
+            OLED_Printf(0, 8, OLED_6X8, "P:%05.2f", AnglePID.Kp);
+            OLED_Printf(0, 16, OLED_6X8, "I:%05.2f", AnglePID.Ki);
+            OLED_Printf(0, 24, OLED_6X8, "D:%05.2f", AnglePID.Kd);
+            OLED_Printf(0, 32, OLED_6X8, "T:%05.1f", AnglePID.Target);
+            OLED_Printf(0, 40, OLED_6X8, "A:%05.1f", Angle);
+            OLED_Printf(0, 48, OLED_6X8, "O:%05.1f", AnglePID.Out);
+            OLED_Printf(0, 56, OLED_6X8, "GY:%+05d", GY);
+            
+            // 速度环数据
+            OLED_Printf(50, 0, OLED_6X8, "Speed");
+            OLED_Printf(50, 8, OLED_6X8, ":%05.2f", SpeedPID.Kp);
+            OLED_Printf(50, 16, OLED_6X8, ":%05.2f", SpeedPID.Ki);
+            OLED_Printf(50, 24, OLED_6X8, ":%05.2f", SpeedPID.Kd);
+            OLED_Printf(50, 32, OLED_6X8, ":%05.1f", SpeedPID.Target);
+            OLED_Printf(50, 40, OLED_6X8, ":%05.1f", AveSpeed);
+            OLED_Printf(50, 48, OLED_6X8, ":%05.1f", SpeedPID.Out);
+            
+            // 转向环数据
+            OLED_Printf(88, 0, OLED_6X8, "Turn");
+            OLED_Printf(88, 8, OLED_6X8, ":%05.2f", TurnPID.Kp);
+            OLED_Printf(88, 16, OLED_6X8, ":%05.2f", TurnPID.Ki);
+            OLED_Printf(88, 24, OLED_6X8, ":%05.2f", TurnPID.Kd);
+            OLED_Printf(88, 32, OLED_6X8, ":%05.1f", TurnPID.Target);
+            OLED_Printf(88, 40, OLED_6X8, ":%05.1f", DifSpeed);
+            OLED_Printf(88, 48, OLED_6X8, ":%05.1f", TurnPID.Out);
+
+            // --- 提交更新 ---
+            OLED_Update(); // 交换指针并开启 DMA
+
+            // --- 执行时间统计 (此时包含所有的 Printf 耗时) ---
+            UI_ExecTime_us = (DWT_CYCCNT - start_time) / (SystemCoreClock / 1000000);
+        }
+        
+        // 绝对延时 100ms
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(100));
+    }
 }
+
+
+
 
 /*
 	重定向，让printf打印内容从UART1发出
